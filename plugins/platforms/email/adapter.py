@@ -2,6 +2,7 @@
 receives, SMTP sends. Configured via EMAIL_* env vars or ``platforms.email`` in config.yaml (see website docs)."""
 
 import asyncio
+import hashlib
 import email as email_lib
 from contextlib import contextmanager, suppress
 import imaplib
@@ -447,6 +448,23 @@ def _attach_file(msg: MIMEMultipart, path: Path, filename: str) -> None:
         msg.attach(part)
 
 
+def _meta_thread(metadata: Optional[dict[str, Any]]) -> Optional[str]:
+    """The gateway's per-send ``metadata["thread_id"]`` (set for replies in a threaded session)."""
+    tid = (metadata or {}).get("thread_id")
+    return str(tid) if tid else None
+
+
+def _thread_root(references: str, in_reply_to: str, message_id: str) -> str:
+    """Root Message-ID of a mail's thread: first References entry, else In-Reply-To, else its own Message-ID."""
+    refs = (references or "").split()
+    return (refs[0] if refs else (in_reply_to or "").strip() or (message_id or "").strip())
+
+
+def _thread_key(root: str) -> str:
+    """Stable, opaque thread id for session keys (Message-IDs may hold ':' and leak hostnames)."""
+    return hashlib.sha256(root.strip().lower().encode()).hexdigest()[:16] if root.strip() else ""
+
+
 class EmailAdapter(BasePlatformAdapter):
     """Email gateway adapter using IMAP (receive) and SMTP (send)."""
     serial_receive_loop = True  # the IMAP poll loop awaits each message before dispatching the next
@@ -497,7 +515,15 @@ class EmailAdapter(BasePlatformAdapter):
         # Track the last IMAP fetch attempt so the poll loop can distinguish "checked, nothing new" from
         # "the check itself failed" (#80016).
         self._thread_context: dict[str, dict[str, str]] = {}
-        logger.info("[Email] Adapter initialized for %s", self._address)
+        # Opt-in: one session per email thread instead of one per sender (EMAIL_THREAD_SESSIONS /
+        # platforms.email.thread_sessions). Each thread gets its own SessionSource.thread_id, so the gateway keys
+        # ``...:email:dm:<sender>:<thread>``; replies keep that thread's subject and References chain.
+        self._thread_sessions = _esecret_bool("EMAIL_THREAD_SESSIONS", is_truthy_value(extra.get("thread_sessions"), default=False))
+        # (sender, thread_id) -> {"subject", "message_id", "root"}; our own sent Message-ID -> thread root, so a
+        # client that sets only In-Reply-To (no References) to one of our replies still lands in the right thread.
+        self._thread_context_by_thread: dict[tuple[str, str], dict[str, str]] = {}
+        self._sent_roots: dict[str, str] = {}
+        logger.info("[Email] Adapter initialized for %s%s", self._address, " (per-thread sessions)" if self._thread_sessions else "")
 
     def _trim_seen_uids(self) -> None:
         """Keep only the highest half of UIDs once over the cap (UIDs are monotonic; UNSEEN prevents re-delivery)."""
@@ -744,6 +770,7 @@ class EmailAdapter(BasePlatformAdapter):
         sender_authenticated, auth_reason = _verify_sender_authentication(msg, sender_addr, authserv_id=self._authserv_id)
         return {"uid": uid, "sender_addr": sender_addr, "sender_name": sender_name, "subject": subject,
                 "message_id": msg.get("Message-ID", ""), "in_reply_to": msg.get("In-Reply-To", ""),
+                "references": " ".join(str(msg.get("References", "")).split()),
                 "date": msg.get("Date", ""), "sender_authenticated": sender_authenticated, "auth_reason": auth_reason}
 
     def _parse_fetched_headers(self, uid: bytes, raw_headers: bytes | bytearray) -> Optional[dict[str, Any]]:
@@ -832,15 +859,26 @@ class EmailAdapter(BasePlatformAdapter):
         # of message_type, but document-context injection gates strictly on MessageType.DOCUMENT — so DOCUMENT surfaces both.
         kinds = {att["type"] for att in attachments}
         self._thread_context[sender_addr] = {"subject": subject, "message_id": msg_data["message_id"]}
+        thread_id = None
+        if self._thread_sessions:
+            in_reply_to = (msg_data.get("in_reply_to") or "").strip()
+            root = _thread_root(msg_data.get("references", ""), in_reply_to, msg_data["message_id"])
+            root = self._sent_roots.get(root, root)  # a reply that only points at one of our mails
+            thread_id = _thread_key(root) or None
+            if thread_id:
+                prev = self._thread_context_by_thread.get((sender_addr, thread_id), {})
+                self._thread_context_by_thread[(sender_addr, thread_id)] = {
+                    # Keep the thread's first subject: a mid-thread subject edit must not fork the reply subject.
+                    "subject": prev.get("subject") or subject, "message_id": msg_data["message_id"], "root": root}
         name = msg_data["sender_name"] or sender_addr
         event = MessageEvent(
             text=text or "(empty email)", message_id=msg_data["message_id"],
             message_type=MessageType.DOCUMENT if "document" in kinds else MessageType.PHOTO if "image" in kinds else MessageType.TEXT,
             source=self.build_source(chat_id=sender_addr, chat_name=name, chat_type="dm", user_id=sender_addr, user_name=name,
-                                     message_id=msg_data["message_id"]),
+                                     thread_id=thread_id, message_id=msg_data["message_id"]),
             media_urls=[att["path"] for att in attachments], media_types=[att["media_type"] for att in attachments],
             reply_to_message_id=msg_data["in_reply_to"] or None)
-        logger.info("[Email] New message from %s: %s", sender_addr, subject)
+        logger.info("[Email] New message from %s: %s%s", sender_addr, subject, f" (thread {thread_id})" if thread_id else "")
         await self.handle_message(event)
 
     async def _run_send(self, fn, args: tuple, log_fmt: str, *log_args) -> SendResult:
@@ -853,22 +891,32 @@ class EmailAdapter(BasePlatformAdapter):
 
     async def send(self, chat_id: str, content: str, reply_to: Optional[str] = None, metadata: Optional[dict[str, Any]] = None) -> SendResult:
         """Send an email reply to the given address."""
-        return await self._run_send(self._send_email, (chat_id, content, reply_to), "[Email] Send failed to %s: %s", chat_id)
+        return await self._run_send(self._send_email, (chat_id, content, reply_to, _meta_thread(metadata)),
+                                    "[Email] Send failed to %s: %s", chat_id)
 
     def _message_id_domain(self) -> str:
         """Domain for generated Message-IDs; ``localhost`` when EMAIL_ADDRESS lacks ``@``."""
         return (self._address.rsplit("@", 1)[-1] if "@" in self._address else "") or "localhost"
 
     def _new_reply(self, to_addr: str, body: str, reply_to_msg_id: Optional[str] = None, *,
-                   attach_empty_body: bool = False) -> tuple[MIMEMultipart, str, str]:
-        """Build a threaded reply skeleton. Returns ``(msg, msg_id, subject)``."""
-        msg, ctx = MIMEMultipart(), self._thread_context.get(to_addr, {})
+                   attach_empty_body: bool = False, thread_id: Optional[str] = None) -> tuple[MIMEMultipart, str, str]:
+        """Build a threaded reply skeleton. Returns ``(msg, msg_id, subject)``.
+        With a known *thread_id* (per-thread sessions) the reply uses that thread's subject and References root."""
+        tctx = self._thread_context_by_thread.get((to_addr, thread_id), {}) if thread_id else {}
+        msg, ctx = MIMEMultipart(), tctx or self._thread_context.get(to_addr, {})
         subject = ctx.get("subject", "Hermes Agent")
         if not subject.startswith("Re:"):
             subject = f"Re: {subject}"
         original_msg_id = reply_to_msg_id or ctx.get("message_id")
-        threading = (("In-Reply-To", original_msg_id), ("References", original_msg_id)) if original_msg_id else ()
+        root = tctx.get("root", "")
+        refs = " ".join(dict.fromkeys(r for r in (root, original_msg_id) if r))
+        threading = (("In-Reply-To", original_msg_id), ("References", refs)) if original_msg_id else ()
         msg_id = f"<hermes-{uuid.uuid4().hex[:12]}@{self._message_id_domain()}>"
+        if root:
+            self._sent_roots[msg_id] = root
+            if len(self._sent_roots) > 2000:  # bounded: drop the oldest half
+                for k in list(self._sent_roots)[:1000]:
+                    del self._sent_roots[k]
         for key, value in (("From", self._address), ("To", to_addr), ("Subject", subject), *threading,
                            ("Date", formatdate(localtime=True)), ("Message-ID", msg_id)):
             msg[key] = value
@@ -888,18 +936,18 @@ class EmailAdapter(BasePlatformAdapter):
             except Exception:
                 smtp.close()
 
-    def _send_email(self, to_addr: str, body: str, reply_to_msg_id: Optional[str] = None) -> str:
+    def _send_email(self, to_addr: str, body: str, reply_to_msg_id: Optional[str] = None, thread_id: Optional[str] = None) -> str:
         """Send an email via SMTP. Runs in executor thread."""
-        msg, msg_id, subject = self._new_reply(to_addr, body, reply_to_msg_id, attach_empty_body=True)
+        msg, msg_id, subject = self._new_reply(to_addr, body, reply_to_msg_id, attach_empty_body=True, thread_id=thread_id)
         self._smtp_send(msg)
         logger.info("[Email] Sent reply to %s (subject: %s)", to_addr, subject)
         return msg_id
 
     def _send_with_files(self, to_addr: str, body: str, files: list[tuple[Path, str]], *, lenient: bool,
-                         reply_to_msg_id: Optional[str] = None) -> str:
+                         reply_to_msg_id: Optional[str] = None, thread_id: Optional[str] = None) -> str:
         """Send a reply with attachments; *lenient* logs-and-skips unattachable files instead of raising.
         An explicit *reply_to_msg_id* threads the mail like ``_send_email`` does (#10131)."""
-        msg, msg_id, _ = self._new_reply(to_addr, body, reply_to_msg_id)
+        msg, msg_id, _ = self._new_reply(to_addr, body, reply_to_msg_id, thread_id=thread_id)
         for path, name in files:
             try:
                 _attach_file(msg, path, name)
@@ -913,7 +961,7 @@ class EmailAdapter(BasePlatformAdapter):
     async def send_image(self, chat_id: str, image_url: str, caption: Optional[str] = None,
                          reply_to: Optional[str] = None, metadata: Optional[dict[str, Any]] = None) -> SendResult:
         """Send an image URL as part of an email body (``metadata`` unused)."""
-        return await self.send(chat_id, f"{caption or ''}\n\nImage: {image_url}".strip(), reply_to)
+        return await self.send(chat_id, f"{caption or ''}\n\nImage: {image_url}".strip(), reply_to, metadata)
 
     async def send_multiple_images(self, chat_id: str, images: list[tuple[str, str]],
                                    metadata: Optional[dict[str, Any]] = None, human_delay: float = 0.0) -> SendResult:
@@ -934,29 +982,32 @@ class EmailAdapter(BasePlatformAdapter):
         if not local_paths and not body_parts:
             return SendResult(success=False, error="no valid images in batch")
         try:
-            message_id = await asyncio.get_running_loop().run_in_executor(None, self._send_email_with_attachments, chat_id, "\n\n".join(body_parts), local_paths)
+            message_id = await asyncio.get_running_loop().run_in_executor(
+                None, self._send_email_with_attachments, chat_id, "\n\n".join(body_parts), local_paths, _meta_thread(metadata))
         except Exception as e:
             logger.error("[Email] Multi-image send failed, falling back: %s", e, exc_info=True)
             return await super().send_multiple_images(chat_id, images, metadata, human_delay)
         return SendResult(success=True, message_id=message_id)
 
-    def _send_email_with_attachments(self, to_addr: str, body: str, file_paths: list[str]) -> str:
+    def _send_email_with_attachments(self, to_addr: str, body: str, file_paths: list[str], thread_id: Optional[str] = None) -> str:
         """Send an email with multiple file attachments via SMTP (unattachable files are skipped)."""
-        msg_id = self._send_with_files(to_addr, body, [(Path(f), Path(f).name) for f in file_paths], lenient=True)
+        msg_id = self._send_with_files(to_addr, body, [(Path(f), Path(f).name) for f in file_paths], lenient=True,
+                                       thread_id=thread_id)
         logger.info("[Email] Sent multi-attachment email to %s (%d files)", to_addr, len(file_paths))
         return msg_id
 
     async def send_document(self, chat_id: str, file_path: str, caption: Optional[str] = None,
                             file_name: Optional[str] = None, reply_to: Optional[str] = None, **kwargs) -> SendResult:
         """Send a file as an email attachment."""
-        return await self._run_send(self._send_email_with_attachment, (chat_id, caption or "", file_path, file_name, reply_to),
+        return await self._run_send(self._send_email_with_attachment,
+                                    (chat_id, caption or "", file_path, file_name, reply_to, _meta_thread(kwargs.get("metadata"))),
                                     "[Email] Send document failed: %s")
 
     def _send_email_with_attachment(self, to_addr: str, body: str, file_path: str, file_name: Optional[str] = None,
-                                    reply_to_msg_id: Optional[str] = None) -> str:
+                                    reply_to_msg_id: Optional[str] = None, thread_id: Optional[str] = None) -> str:
         """Send an email with a single file attachment via SMTP (raises if unattachable)."""
         return self._send_with_files(to_addr, body, [(Path(file_path), file_name or Path(file_path).name)], lenient=False,
-                                     reply_to_msg_id=reply_to_msg_id)
+                                     reply_to_msg_id=reply_to_msg_id, thread_id=thread_id)
 
     async def get_chat_info(self, chat_id: str) -> dict[str, Any]:
         """Return basic info about the email chat."""

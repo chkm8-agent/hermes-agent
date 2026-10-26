@@ -155,6 +155,24 @@ Replies are sent via SMTP with proper email threading:
 
 The agent can send file attachments in replies. Include `MEDIA:/path/to/file` in the response and the file is attached to the outgoing email.
 
+### One Conversation per Email Thread
+
+By default every email from the same sender continues **one** conversation, whatever the subject. To give each email thread its own session instead, enable per-thread sessions:
+
+```bash
+EMAIL_THREAD_SESSIONS=true
+```
+
+or in `config.yaml`:
+
+```yaml
+platforms:
+  email:
+    thread_sessions: true
+```
+
+With it on, a new email (new subject, no `In-Reply-To`) starts a fresh conversation, and replies in that thread continue it. The thread is identified by its root Message-ID (the first `References` entry, else `In-Reply-To`, else the mail's own Message-ID), so changing the subject mid-thread does not split it, and replies to a cron or other agent-initiated email continue a conversation of their own. Each thread's replies keep that thread's subject. `/new` inside a thread resets only that thread. Turning the option on leaves the old per-sender conversation in history; it is simply no longer continued.
+
 ### Skipping Attachments
 
 To ignore all incoming attachments (for malware protection or bandwidth savings), add to your `config.yaml`:
@@ -230,6 +248,7 @@ Hermes acts on a message only when the `Authentication-Results` header stamped b
 | `EMAIL_IMAP_PORT` | No | `993` | IMAP server port |
 | `EMAIL_SMTP_PORT` | No | `587` | SMTP server port |
 | `EMAIL_POLL_INTERVAL` | No | `15` | Seconds between inbox checks |
+| `EMAIL_THREAD_SESSIONS` | No | `false` | One session per email thread instead of one per sender |
 | `EMAIL_ALLOWED_USERS` | No | — | Comma-separated allowed sender addresses |
 | `EMAIL_AUTHSERV_ID` | Yes, unless sender authentication is off | — | Exact authserv-id on your receiving server's topmost `Authentication-Results` header; without it every message needing an authenticated `From:` is dropped |
 | `EMAIL_HOME_ADDRESS` | No | — | Default delivery target for cron jobs |
